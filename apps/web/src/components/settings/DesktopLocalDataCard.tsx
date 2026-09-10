@@ -4,6 +4,13 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
+  SETTINGS_CARD_DESCRIPTION_CLASSNAME,
+  SETTINGS_CARD_HEADER_CLASSNAME,
+  SETTINGS_CARD_ICON_CLASSNAME,
+  SETTINGS_CARD_TITLE_CLASSNAME,
+} from "./settings-ui";
+import { cn } from "@/lib/utils";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -12,41 +19,52 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
+const localDataResetErrorKeys: Record<DesktopLocalDataResetErrorCode, string> = {
+  "unsafe-data-directory": "localDataReset.errors.unsafeDataDirectory",
+  "application-bundle-not-found": "localDataReset.errors.applicationBundleNotFound",
+  "helper-start-failed": "localDataReset.errors.helperStartFailed",
+  unexpected: "localDataReset.errors.unexpected",
+};
+
 export const DesktopLocalDataCard = () => {
   const { t } = useTranslation();
   const bridge = window.edgeeverDesktop;
   const [confirmationOpen, setConfirmationOpen] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
-  const [error, setError] = useState(false);
+  const [errorCode, setErrorCode] = useState<DesktopLocalDataResetErrorCode | null>(null);
 
   if (!bridge?.canClearLocalData) return null;
 
   const handleClear = async () => {
     setIsClearing(true);
-    setError(false);
+    setErrorCode(null);
     try {
-      await bridge.clearLocalData();
+      const result = await bridge.clearLocalData();
+      if (!result.scheduled) {
+        setIsClearing(false);
+        setErrorCode(result.errorCode);
+      }
     } catch {
       setIsClearing(false);
-      setError(true);
+      setErrorCode("unexpected");
     }
   };
 
   return (
     <>
       <Card className="w-full min-w-0 overflow-hidden border-rose-100 bg-rose-50/30 shadow-none">
-        <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-3">
-          <CardTitle className="flex items-center gap-2 text-sm text-rose-800">
-            <AlertTriangle className="h-4 w-4" />
+        <CardHeader className={SETTINGS_CARD_HEADER_CLASSNAME}>
+          <CardTitle className={cn(SETTINGS_CARD_TITLE_CLASSNAME, "text-rose-800")}>
+            <AlertTriangle className={cn(SETTINGS_CARD_ICON_CLASSNAME, "text-rose-700")} />
             {t("localDataReset.title")}
           </CardTitle>
-          <CardDescription className="text-xs leading-5">{t("localDataReset.description")}</CardDescription>
+          <CardDescription className={SETTINGS_CARD_DESCRIPTION_CLASSNAME}>{t("localDataReset.description")}</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 p-4 pt-0 sm:px-5 sm:pb-5">
-          {error ? (
+          {errorCode ? (
             <p className="flex items-center gap-1.5 text-xs text-rose-700" role="alert">
               <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-              {t("localDataReset.error")}
+              {t(localDataResetErrorKeys[errorCode])}
             </p>
           ) : null}
           <div>
@@ -55,7 +73,7 @@ export const DesktopLocalDataCard = () => {
               variant="danger"
               className="bg-rose-600 font-semibold text-white shadow-sm hover:bg-rose-700"
               onClick={() => {
-                setError(false);
+                setErrorCode(null);
                 setConfirmationOpen(true);
               }}
             >

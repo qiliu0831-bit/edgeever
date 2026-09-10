@@ -1,6 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
+import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { BookmarkPlus, Check, Copy, Library, Loader2, PenLine, RefreshCw, Sparkles, Square, Trash2 } from "lucide-react";
+import { AlertCircle, BookmarkPlus, Check, Copy, FileText, GripHorizontal, Library, Loader2, Paperclip, PenLine, RefreshCw, Sparkles, Square, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,32 +33,66 @@ import {
 } from "@/components/ui/select";
 import { api, ApiRequestError } from "@/lib/api";
 import {
+  AI_ATTACHMENT_ACCEPT,
+  AiAttachmentError,
+  formatAiAttachmentSize,
+  prepareAiAttachments,
+  type PreparedAiAttachment,
+} from "@/lib/ai-attachments";
+import {
   aiTones,
   buildAiAssistantRequest,
+  buildAiRefinementInstruction,
   getDefaultAiAction,
   getDefaultTargetLanguage,
   promptAllowsAppend,
   promptAllowsReplace,
   promptNeedsTargetLanguage,
   promptNeedsTone,
+  resolveAiAssistantComposerInput,
   targetLanguages,
   type AiAssistantAction,
   type AiTone,
   type TargetLanguage,
 } from "@/lib/ai-assistant";
 import { copyTextToClipboard } from "@/lib/clipboard";
+import {
+  clampFloatingPanelPosition,
+  resolveAnchoredFloatingPanelLayout,
+  type FloatingPanelPosition,
+} from "@/lib/floating-panel";
 import { cn } from "@/lib/utils";
 
 const FREEFORM_VALUE = "custom";
 const PROMPT_VALUE_PREFIX = "prompt:";
+const AI_ASSISTANT_LAYER_SELECTOR = '[data-edgeever-ai-assistant-layer="true"]';
+const AI_ASSISTANT_VIEWPORT_GAP = 12;
+
+const getViewportSize = () => ({
+  height: typeof window === "undefined" ? 768 : window.innerHeight,
+  width: typeof window === "undefined" ? 1024 : window.innerWidth,
+});
+
+export const isAiAssistantPointerTarget = (target: EventTarget | null, panel: HTMLElement | null) => {
+  if (!(target instanceof Node)) return false;
+  if (panel?.contains(target)) return true;
+  return target instanceof Element && Boolean(target.closest(AI_ASSISTANT_LAYER_SELECTOR));
+};
 
 const promptSelectValue = (id: string) => `${PROMPT_VALUE_PREFIX}${id}`;
 
 const parsePromptSelectValue = (value: string) =>
   value.startsWith(PROMPT_VALUE_PREFIX) ? value.slice(PROMPT_VALUE_PREFIX.length) : null;
 
+export type AiAssistantAnchor = {
+  left: number;
+  placement: "above" | "below";
+  top: number;
+};
+
 export const AiAssistantDialog = ({
   open,
+  anchor,
   title,
   contentMarkdown,
   selectionMarkdown,
@@ -57,11 +101,12 @@ export const AiAssistantDialog = ({
   onOpenPromptLibrary,
 }: {
   open: boolean;
+  anchor: AiAssistantAnchor;
   title: string;
   contentMarkdown: string;
   selectionMarkdown?: string | null;
   onOpenChange: (open: boolean) => void;
-  onApply: (text: string, mode: "append" | "replace") => void;
+  onApply: (text: string, mode: "append" | "replace") => boolean;
   onOpenPromptLibrary?: () => void;
 }) => {
   const { t, i18n } = useTranslation();
@@ -84,9 +129,33 @@ export const AiAssistantDialog = ({
   const [saveName, setSaveName] = useState("");
   const [saveDescription, setSaveDescription] = useState("");
   const [promptFeedback, setPromptFeedback] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<PreparedAiAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [isReadingAttachments, setIsReadingAttachments] = useState(false);
   const [initializedForOpen, setInitializedForOpen] = useState(false);
+  const [panelElement, setPanelElement] = useState<HTMLElement | null>(null);
+  const [draggedPosition, setDraggedPosition] = useState<FloatingPanelPosition | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [viewportSize, setViewportSize] = useState(getViewportSize);
   const controllerRef = useRef<AbortController | null>(null);
-  const lastRequestRef = useRef<Parameters<typeof api.streamAiGeneration>[0] | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const dragStateRef = useRef<{
+    offsetX: number;
+    offsetY: number;
+    pointerId: number;
+  } | null>(null);
+  const instructionRef = useRef<HTMLTextAreaElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const attachmentReadIdRef = useRef(0);
+  const customInstructionEditedRef = useRef(false);
+  const lastRequestRef = useRef<{
+    preserveOutput: boolean;
+    request: Parameters<typeof api.streamAiGeneration>[0];
+  } | null>(null);
+  const assignPanelRef = useCallback((node: HTMLElement | null) => {
+    panelRef.current = node;
+    setPanelElement(node);
+  }, []);
 
   const promptsQuery = useQuery({
     queryKey: ["ai-prompts", i18n.resolvedLanguage],
@@ -110,8 +179,12 @@ export const AiAssistantDialog = ({
   useEffect(() => () => controllerRef.current?.abort(), []);
   useEffect(() => {
     controllerRef.current?.abort();
+    attachmentReadIdRef.current += 1;
     if (!open) {
       setInitializedForOpen(false);
+      setDraggedPosition(null);
+      setIsDragging(false);
+      dragStateRef.current = null;
       return;
     }
     setAction(defaultAction);
@@ -128,33 +201,78 @@ export const AiAssistantDialog = ({
     setSaveName("");
     setSaveDescription("");
     setPromptFeedback(null);
+    setAttachments([]);
+    setAttachmentError(null);
+    setIsReadingAttachments(false);
     setInitializedForOpen(false);
+    setDraggedPosition(null);
+    setIsDragging(false);
+    dragStateRef.current = null;
+    customInstructionEditedRef.current = false;
     lastRequestRef.current = null;
   }, [defaultAction, defaultTargetLanguage, hasSelection, open]);
 
-  // Once prompts load, pick the library entry that matches the default action (same text as the library).
+  useEffect(() => {
+    if (!open) return;
+    const handleResize = () => {
+      const nextViewportSize = getViewportSize();
+      setViewportSize(nextViewportSize);
+      setDraggedPosition((current) => {
+        const panel = panelRef.current;
+        if (!current || !panel) return current;
+        const panelRect = panel.getBoundingClientRect();
+        return clampFloatingPanelPosition(
+          current,
+          { height: panelRect.height, width: panelRect.width },
+          nextViewportSize,
+          AI_ASSISTANT_VIEWPORT_GAP,
+        );
+      });
+    };
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [open]);
+
   useEffect(() => {
     if (!open || initializedForOpen || promptsQuery.isLoading) return;
+    if (customInstructionEditedRef.current || customInstruction.trim()) {
+      setSelectedPromptId(null);
+      setAction("custom");
+      setInitializedForOpen(true);
+      return;
+    }
     const preferred = prompts.find((prompt) => prompt.seedKey === defaultAction)
       ?? prompts[0]
       ?? null;
     if (preferred) {
       setSelectedPromptId(preferred.id);
       setAction(preferred.action);
-      setCustomInstruction(preferred.instruction);
     } else {
-      setAction("custom");
       setSelectedPromptId(null);
-      setCustomInstruction("");
+      setAction("custom");
     }
     setInitializedForOpen(true);
-  }, [defaultAction, initializedForOpen, open, prompts, promptsQuery.isLoading]);
+  }, [customInstruction, defaultAction, initializedForOpen, open, prompts, promptsQuery.isLoading]);
+
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => instructionRef.current?.focus());
+    const handlePointerDown = (event: PointerEvent) => {
+      if (isAiAssistantPointerTarget(event.target, panelRef.current)) return;
+      onOpenChange(false);
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [onOpenChange, open]);
 
   useEffect(() => {
     if (!open || !initializedForOpen || promptsQuery.isLoading || !selectedPromptId || selectedPrompt) return;
     setSelectedPromptId(null);
     setAction("custom");
-    setCustomInstruction("");
     setOutput("");
     setError(t("aiAssistant.promptMissing"));
   }, [initializedForOpen, open, promptsQuery.isLoading, selectedPrompt, selectedPromptId, t]);
@@ -166,10 +284,10 @@ export const AiAssistantDialog = ({
   };
 
   const handleActionChange = (value: string) => {
+    customInstructionEditedRef.current = false;
     if (value === FREEFORM_VALUE) {
       setAction("custom");
       setSelectedPromptId(null);
-      setCustomInstruction("");
       clearResult();
       return;
     }
@@ -179,34 +297,62 @@ export const AiAssistantDialog = ({
     const prompt = prompts.find((item) => item.id === promptId);
     setSelectedPromptId(promptId);
     setAction(prompt?.action ?? "custom");
-    setCustomInstruction(prompt?.instruction ?? "");
     clearResult();
   };
 
-  const runGeneration = async (request: Parameters<typeof api.streamAiGeneration>[0]) => {
+  const handleComposerChange = (value: string) => {
+    customInstructionEditedRef.current = true;
+    if (!initializedForOpen) {
+      setSelectedPromptId(null);
+      setAction("custom");
+    }
+    setCustomInstruction(value);
+    clearResult();
+  };
+
+  const runGeneration = async (
+    request: Parameters<typeof api.streamAiGeneration>[0],
+    { preserveOutput = false }: { preserveOutput?: boolean } = {},
+  ) => {
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
-    lastRequestRef.current = request;
-    setOutput("");
+    lastRequestRef.current = { preserveOutput, request };
+    if (!preserveOutput) setOutput("");
     setError(null);
     setCopied(false);
     setIsGenerating(true);
+    let receivedOutput = false;
     try {
       await api.streamAiGeneration(
         request,
         {
           signal: controller.signal,
           onEvent: (event) => {
-            if (event.type === "text-delta") setOutput((current) => current + event.text);
+            if (event.type === "text-delta") {
+              if (preserveOutput && !receivedOutput) {
+                receivedOutput = true;
+                setOutput(event.text);
+              } else {
+                setOutput((current) => current + event.text);
+              }
+            }
             if (event.type === "error") setError(event.message);
           },
         },
       );
     } catch (caught) {
       if (controller.signal.aborted || (caught instanceof DOMException && caught.name === "AbortError")) return;
-      setError(caught instanceof ApiRequestError && caught.code === "ai_not_configured"
-        ? t("aiAssistant.configure")
+      setError(caught instanceof ApiRequestError
+        ? caught.code === "ai_not_configured"
+          ? t("aiAssistant.configure")
+          : caught.code === "ai_source_required"
+            ? t("aiAssistant.sourceRequired")
+            : caught.code === "ai_request_invalid"
+              ? t("aiAssistant.requestInvalid")
+              : caught.message
+        : caught instanceof TypeError && caught.message === "Failed to fetch"
+          ? t("aiAssistant.networkError")
         : caught instanceof Error ? caught.message : t("aiModel.failed"));
     } finally {
       if (controllerRef.current === controller) {
@@ -216,33 +362,96 @@ export const AiAssistantDialog = ({
     }
   };
 
-  const generate = () => runGeneration(buildAiAssistantRequest({
-    action: effectiveActionKey,
-    contentMarkdown: sourceMarkdown,
-    customInstruction,
-    locale: i18n.resolvedLanguage,
-    parameterKind: selectedPrompt ? effectiveParameterKind : undefined,
-    promptId: selectedPrompt?.id,
-    targetLanguage,
-    title,
-    tone,
-  }));
+  const generate = () => {
+    const currentInstruction = instructionRef.current?.value ?? customInstruction;
+    if (!selectedPrompt && effectiveActionKey === "custom" && !currentInstruction.trim()) {
+      setError(t("aiAssistant.customInstructionRequired"));
+      instructionRef.current?.focus();
+      return;
+    }
+
+    const composerInput = resolveAiAssistantComposerInput({
+      composerText: currentInstruction,
+      isFreeformCustom,
+      noteContentMarkdown: sourceMarkdown,
+      noteTitle: title,
+    });
+
+    return runGeneration(buildAiAssistantRequest({
+      action: effectiveActionKey,
+      contentMarkdown: composerInput.contentMarkdown,
+      customInstruction: composerInput.customInstruction,
+      locale: i18n.resolvedLanguage,
+      parameterKind: selectedPrompt ? effectiveParameterKind : undefined,
+      promptId: selectedPrompt?.id,
+      targetLanguage,
+      title: composerInput.title,
+      tone,
+      attachments: attachments.map(({ byteLength: _byteLength, ...attachment }) => attachment),
+    }));
+  };
+
+  const addAttachments = async (files: File[]) => {
+    if (!files.length) return;
+    const readId = attachmentReadIdRef.current + 1;
+    attachmentReadIdRef.current = readId;
+    setAttachmentError(null);
+    setIsReadingAttachments(true);
+    try {
+      const prepared = await prepareAiAttachments(files, attachments);
+      if (attachmentReadIdRef.current !== readId) return;
+      setAttachments((current) => [...current, ...prepared]);
+      clearResult();
+    } catch (caught) {
+      if (attachmentReadIdRef.current !== readId) return;
+      const code = caught instanceof AiAttachmentError ? caught.code : "readFailed";
+      setAttachmentError(t(`aiAssistant.attachmentErrors.${code}`));
+    } finally {
+      if (attachmentReadIdRef.current === readId) {
+        setIsReadingAttachments(false);
+        if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+      }
+    }
+  };
 
   const refine = () => {
     const instruction = refinement.trim();
     if (!output || !instruction) return;
-    setRefinement("");
+    const refinementTargetLanguage = promptNeedsTargetLanguage(effectiveParameterKind)
+      ? targetLanguage
+      : undefined;
+    const refinementTone = promptNeedsTone(effectiveParameterKind) ? tone : undefined;
     return runGeneration({
       action: "custom",
-      title,
+      title: "",
       contentMarkdown: output,
-      instruction,
-    });
+      instruction: buildAiRefinementInstruction({
+        originalAction: effectiveActionKey,
+        originalInstruction: selectedPrompt?.instruction
+          ?? (isFreeformCustom ? customInstruction : undefined),
+        refinement: instruction,
+        targetLanguage: refinementTargetLanguage,
+        tone: refinementTone,
+      }),
+      targetLanguage: refinementTargetLanguage,
+      tone: refinementTone,
+    }, { preserveOutput: true });
   };
 
   const retry = () => {
-    if (lastRequestRef.current) return runGeneration(lastRequestRef.current);
+    if (lastRequestRef.current) {
+      return runGeneration(lastRequestRef.current.request, {
+        preserveOutput: lastRequestRef.current.preserveOutput,
+      });
+    }
     return generate();
+  };
+
+  const applyOutput = (mode: "append" | "replace") => {
+    setError(null);
+    if (!onApply(output, mode)) {
+      setError(t("aiAssistant.applyFailed"));
+    }
   };
 
   const copy = async () => {
@@ -260,15 +469,22 @@ export const AiAssistantDialog = ({
       parameterKind: "none",
       resultMode: "both",
     }),
-    onSuccess: async (response) => {
-      await queryClient.invalidateQueries({ queryKey: ["ai-prompts"] });
-      setSelectedPromptId(response.prompt.id);
-      setAction(response.prompt.action);
-      setCustomInstruction(response.prompt.instruction);
+    onSuccess: ({ prompt }) => {
+      queryClient.setQueryData(
+        ["ai-prompts", i18n.resolvedLanguage],
+        (current: typeof prompts | undefined) => [
+          ...(current ?? []).filter((item) => item.id !== prompt.id),
+          prompt,
+        ],
+      );
+      setSelectedPromptId(prompt.id);
+      setAction(prompt.action);
+      customInstructionEditedRef.current = false;
       setSaveDialogOpen(false);
       setSaveName("");
       setSaveDescription("");
       setPromptFeedback(t("aiAssistant.promptSaved"));
+      void queryClient.invalidateQueries({ queryKey: ["ai-prompts"] });
     },
   });
 
@@ -278,38 +494,133 @@ export const AiAssistantDialog = ({
       : t("aiAssistant.promptSaveFailed")
     : null;
 
-  // Only freeform "自定义指令" shows the instruction editor. Library presets stay one-click.
   const isFreeformCustom = !selectedPromptId && action === "custom";
-  const showInstructionEditor = isFreeformCustom;
+  const usesComposerAsSource = !isFreeformCustom && Boolean(customInstruction.trim());
   const canSaveAsPrompt = isFreeformCustom && customInstruction.trim().length > 0;
   const generateDisabled = isGenerating
-    || (isFreeformCustom && !customInstruction.trim())
-    || (!isFreeformCustom && !selectedPromptId)
-    || (promptNeedsTargetLanguage(effectiveParameterKind) && !targetLanguage)
-    || (promptNeedsTone(effectiveParameterKind) && !tone);
+    || isReadingAttachments;
+
+  const handleDragStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || event.pointerType === "touch") return;
+    if (event.target instanceof Element && event.target.closest("button")) return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const panelRect = panel.getBoundingClientRect();
+    dragStateRef.current = {
+      offsetX: event.clientX - panelRect.left,
+      offsetY: event.clientY - panelRect.top,
+      pointerId: event.pointerId,
+    };
+    setDraggedPosition({ left: panelRect.left, top: panelRect.top });
+    setIsDragging(true);
+    event.preventDefault();
+  }, []);
+
+  const handleDragMove = useCallback((event: PointerEvent) => {
+    const dragState = dragStateRef.current;
+    const panel = panelRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId || !panel) return;
+    const panelRect = panel.getBoundingClientRect();
+    setDraggedPosition(clampFloatingPanelPosition(
+      {
+        left: event.clientX - dragState.offsetX,
+        top: event.clientY - dragState.offsetY,
+      },
+      { height: panelRect.height, width: panelRect.width },
+      getViewportSize(),
+      AI_ASSISTANT_VIEWPORT_GAP,
+    ));
+  }, []);
+
+  const handleDragEnd = useCallback((event: PointerEvent) => {
+    if (dragStateRef.current?.pointerId !== event.pointerId) return;
+    dragStateRef.current = null;
+    setIsDragging(false);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleWindowBlur = () => {
+      dragStateRef.current = null;
+      setIsDragging(false);
+    };
+    window.addEventListener("pointermove", handleDragMove);
+    window.addEventListener("pointerup", handleDragEnd);
+    window.addEventListener("pointercancel", handleDragEnd);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("pointermove", handleDragMove);
+      window.removeEventListener("pointerup", handleDragEnd);
+      window.removeEventListener("pointercancel", handleDragEnd);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [handleDragEnd, handleDragMove, open]);
+
+  const panelStyle = useMemo<CSSProperties>(() => {
+    const { height: viewportHeight, width: viewportWidth } = viewportSize;
+    if (draggedPosition) {
+      return {
+        left: draggedPosition.left,
+        maxHeight: Math.max(0, Math.min(viewportHeight * 0.7, viewportHeight - draggedPosition.top - AI_ASSISTANT_VIEWPORT_GAP)),
+        top: draggedPosition.top,
+      };
+    }
+    const panelWidth = Math.min(576, Math.max(0, viewportWidth - AI_ASSISTANT_VIEWPORT_GAP * 2));
+    return resolveAnchoredFloatingPanelLayout(
+      anchor,
+      panelWidth,
+      { height: viewportHeight, width: viewportWidth },
+      AI_ASSISTANT_VIEWPORT_GAP,
+    );
+  }, [anchor, draggedPosition, viewportSize]);
 
   return (
     <>
-      <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="max-h-[90dvh] max-w-3xl overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><Sparkles className="h-5 w-5 text-emerald-600" />{t("aiAssistant.title")}</DialogTitle>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
-              <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
-                <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-800">
-                  {t(hasSelection ? "aiAssistant.selectedScope" : "aiAssistant.noteScope")}
-                </span>
-                {hasSelection ? null : t("aiAssistant.noteScopeHint")}
-              </div>
-              {hasSelection ? (
-                <p className="mt-2 max-h-16 overflow-hidden whitespace-pre-wrap border-l-2 border-emerald-200 pl-3 text-xs leading-5 text-slate-500">
-                  {selectionMarkdown}
-                </p>
-              ) : null}
+      {open && typeof document !== "undefined" ? createPortal(
+        <section
+          ref={assignPanelRef}
+          aria-label={t("aiAssistant.title")}
+          className="fixed z-[70] flex max-h-[70dvh] w-[min(36rem,calc(100vw-1.5rem))] flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4 shadow-2xl ring-1 ring-slate-950/5"
+          role="dialog"
+          style={panelStyle}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              onOpenChange(false);
+            }
+          }}
+        >
+          <div
+            className={cn(
+              "-mx-4 -mt-4 mb-3 flex h-16 shrink-0 touch-none select-none items-center justify-between gap-3 px-4 cursor-grab",
+              isDragging && "cursor-grabbing",
+            )}
+            data-ai-assistant-drag-handle="true"
+            onPointerDown={handleDragStart}
+          >
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <Sparkles className="h-5 w-5 shrink-0 text-emerald-600" />
+              <span className="truncate text-sm font-semibold text-slate-950">{t("aiAssistant.title")}</span>
+              <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                {t(usesComposerAsSource
+                  ? "aiAssistant.inputScope"
+                  : hasSelection ? "aiAssistant.selectedScope" : "aiAssistant.noteScope")}
+              </span>
+              <GripHorizontal aria-hidden="true" className="ml-auto h-4 w-4 shrink-0 text-slate-300" />
             </div>
-            <div className="grid gap-2">
+            <Button type="button" size="icon" variant="ghost" className="h-8 w-8 shrink-0 cursor-pointer" aria-label={t("common.close")} onClick={() => onOpenChange(false)}>
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="grid gap-4">
+            {hasSelection ? (
+              <p className="max-h-12 overflow-hidden whitespace-pre-wrap border-l-2 border-emerald-200 pl-3 text-xs leading-5 text-slate-500">
+                {selectionMarkdown}
+              </p>
+            ) : null}
+            <div className="order-3 grid gap-2">
               <div className="flex items-center justify-between gap-3">
                 <span className="text-sm font-medium text-slate-700">{t("aiAssistant.actionLabel")}</span>
                 {onOpenPromptLibrary ? (
@@ -326,12 +637,18 @@ export const AiAssistantDialog = ({
                   </button>
                 ) : null}
               </div>
-              <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
+              <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
                 <Select value={selectValue} onValueChange={handleActionChange}>
-                  <SelectTrigger aria-label={t("aiAssistant.actionLabel")} className="h-10 w-full min-w-0 sm:col-span-2">
+                  <SelectTrigger aria-label={t("aiAssistant.actionLabel")} className="h-10 w-full min-w-0">
                     <SelectValue placeholder={t("aiAssistant.actionLabel")} />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent
+                    className="z-[80] max-h-[min(20rem,var(--radix-select-content-available-height))]"
+                    collisionBoundary={panelElement}
+                    collisionPadding={8}
+                    sideOffset={6}
+                    data-edgeever-ai-assistant-layer="true"
+                  >
                     {prompts.length ? (
                       <SelectGroup>
                         <SelectLabel>{t("aiAssistant.myPrompts")}</SelectLabel>
@@ -347,30 +664,34 @@ export const AiAssistantDialog = ({
                     </SelectGroup>
                   </SelectContent>
                 </Select>
-                <div className="grid min-w-0 grid-cols-2 gap-2">
+                <div className="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-[8rem_7rem]">
                   <Button
                     type="button"
                     variant={!selectedPromptId && action === "custom" ? "solid" : "outline"}
-                    className="h-10 min-w-0 w-full gap-1 px-2 text-xs font-normal text-slate-600"
+                    className="h-10 min-w-0 w-full gap-1 whitespace-nowrap px-3 text-xs font-normal text-slate-600"
                     onClick={() => handleActionChange(FREEFORM_VALUE)}
                   >
-                    <PenLine className="h-3.5 w-3.5" />
+                    <PenLine className="h-3.5 w-3.5 shrink-0" />
                     {t("aiAssistant.useCustom")}
                   </Button>
                   {isGenerating ? (
-                    <Button type="button" variant="solid" className="h-10 min-w-0 w-full gap-1.5 px-2 text-sm font-semibold" onClick={() => controllerRef.current?.abort()}>
-                      <Square className="h-3.5 w-3.5" />{t("aiAssistant.stop")}
+                    <Button type="button" variant="solid" className="h-10 min-w-0 w-full gap-1.5 whitespace-nowrap px-3 text-sm font-semibold" onClick={() => controllerRef.current?.abort()}>
+                      <Square className="h-3.5 w-3.5 shrink-0" />{t("aiAssistant.stop")}
                     </Button>
                   ) : (
-                    <Button type="button" variant="solid" className="h-10 min-w-0 w-full gap-1.5 px-2 text-sm font-semibold" disabled={generateDisabled} onClick={() => void generate()}>
-                      <Sparkles className="h-4 w-4" />{t("aiAssistant.generate")}
+                    <Button type="button" variant="solid" className="h-10 min-w-0 w-full gap-1.5 whitespace-nowrap px-3 text-sm font-semibold" disabled={generateDisabled} onClick={() => void generate()}>
+                      <Sparkles className="h-4 w-4 shrink-0" />
+                      {t("aiAssistant.generate")}
+                      <kbd aria-hidden="true" className="ml-0.5 rounded bg-white/10 px-1 py-0.5 text-[10px] font-medium leading-none text-white/65">
+                        ↵
+                      </kbd>
                     </Button>
                   )}
                 </div>
               </div>
             </div>
             {promptNeedsTargetLanguage(effectiveParameterKind) ? (
-              <div className="grid gap-1.5">
+              <div className="order-2 grid gap-1.5">
                 <span className="text-sm font-medium text-slate-700">{t("aiAssistant.targetLanguage")}</span>
                 <Select value={targetLanguage} onValueChange={(value) => {
                   setTargetLanguage(value as TargetLanguage);
@@ -379,7 +700,13 @@ export const AiAssistantDialog = ({
                   <SelectTrigger aria-label={t("aiAssistant.targetLanguage")} className="h-10">
                     <SelectValue />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent
+                    className="z-[80] max-h-[min(20rem,var(--radix-select-content-available-height))]"
+                    collisionBoundary={panelElement}
+                    collisionPadding={8}
+                    sideOffset={6}
+                    data-edgeever-ai-assistant-layer="true"
+                  >
                     {targetLanguages.map((language) => (
                       <SelectItem key={language} value={language}>{t(`aiAssistant.targetLanguages.${language}`)}</SelectItem>
                     ))}
@@ -388,57 +715,124 @@ export const AiAssistantDialog = ({
               </div>
             ) : null}
             {promptNeedsTone(effectiveParameterKind) ? (
-              <div className="grid gap-1.5">
+              <div className="order-2 grid gap-1.5">
                 <span className="text-sm font-medium text-slate-700">{t("aiAssistant.tone")}</span>
                 <Select value={tone} onValueChange={(value) => {
                   setTone(value as AiTone);
                   clearResult();
                 }}>
                   <SelectTrigger aria-label={t("aiAssistant.tone")} className="h-10"><SelectValue /></SelectTrigger>
-                  <SelectContent>
+                  <SelectContent
+                    className="z-[80] max-h-[min(20rem,var(--radix-select-content-available-height))]"
+                    collisionBoundary={panelElement}
+                    collisionPadding={8}
+                    sideOffset={6}
+                    data-edgeever-ai-assistant-layer="true"
+                  >
                     {aiTones.map((item) => <SelectItem key={item} value={item}>{t(`aiAssistant.tones.${item}`)}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </div>
             ) : null}
-            {showInstructionEditor ? (
-              <div className="grid gap-2">
-                <label className="grid gap-1.5 text-sm font-medium text-slate-700">
-                  {t("aiAssistant.customInstruction")}
-                  <textarea
-                    className="min-h-28 resize-y rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-normal text-slate-900 outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-500/15"
-                    value={customInstruction}
-                    onChange={(event) => {
-                      setCustomInstruction(event.target.value);
-                      clearResult();
+            <div className="order-1 grid gap-2">
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                {t(isFreeformCustom ? "aiAssistant.customInstruction" : "aiAssistant.inputContent")}
+                <textarea
+                  ref={instructionRef}
+                  className="min-h-24 resize-y rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-normal text-slate-900 outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-500/15"
+                  value={customInstruction}
+                  onChange={(event) => {
+                    handleComposerChange(event.target.value);
+                  }}
+                  onCompositionEnd={(event) => {
+                    handleComposerChange(event.currentTarget.value);
+                  }}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key !== "Enter"
+                      || event.shiftKey
+                      || event.nativeEvent.isComposing
+                      || isGenerating
+                      || isReadingAttachments
+                    ) {
+                      return;
+                    }
+                    event.preventDefault();
+                    void generate();
+                  }}
+                  placeholder={t(isFreeformCustom
+                    ? "aiAssistant.customInstructionPlaceholder"
+                    : "aiAssistant.inputContentPlaceholder")}
+                  maxLength={2_000}
+                />
+              </label>
+              <div className="flex flex-wrap gap-2">
+                <input
+                  ref={attachmentInputRef}
+                  className="sr-only"
+                  type="file"
+                  multiple
+                  accept={AI_ATTACHMENT_ACCEPT}
+                  onChange={(event) => void addAttachments(Array.from(event.target.files ?? []))}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={isGenerating || isReadingAttachments}
+                  onClick={() => attachmentInputRef.current?.click()}
+                >
+                  {isReadingAttachments
+                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    : <Paperclip className="h-3.5 w-3.5" />}
+                  {t("aiAssistant.addAttachment")}
+                </Button>
+                {canSaveAsPrompt ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setSaveName("");
+                      setSaveDescription("");
+                      setSaveDialogOpen(true);
+                      createPromptMutation.reset();
                     }}
-                    placeholder={t("aiAssistant.customInstructionPlaceholder")}
-                    maxLength={2_000}
-                  />
-                </label>
-                <div className="flex flex-wrap gap-2">
-                  {canSaveAsPrompt ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => {
-                        setSaveName("");
-                        setSaveDescription("");
-                        setSaveDialogOpen(true);
-                        createPromptMutation.reset();
-                      }}
-                    >
-                      <BookmarkPlus className="h-3.5 w-3.5" />
-                      {t("aiAssistant.saveAsPrompt")}
-                    </Button>
-                  ) : null}
-                </div>
-                {promptFeedback ? <p className="text-xs font-medium text-emerald-700">{promptFeedback}</p> : null}
-                {promptErrorMessage ? <p className="text-xs font-medium text-rose-600" role="alert">{promptErrorMessage}</p> : null}
+                  >
+                    <BookmarkPlus className="h-3.5 w-3.5" />
+                    {t("aiAssistant.saveAsPrompt")}
+                  </Button>
+                ) : null}
               </div>
-            ) : null}
-            <div className="grid gap-1.5">
+              {attachments.length ? (
+                <ul className="flex flex-wrap gap-2" aria-label={t("aiAssistant.attachments")}>
+                  {attachments.map((attachment, index) => (
+                    <li key={`${attachment.filename}-${index}`} className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-700">
+                      <FileText className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                      <span className="max-w-48 truncate">{attachment.filename}</span>
+                      <span className="shrink-0 text-slate-400">{formatAiAttachmentSize(attachment.byteLength)}</span>
+                      <button
+                        type="button"
+                        className="ml-0.5 rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+                        aria-label={t("aiAssistant.removeAttachment", { name: attachment.filename })}
+                        onClick={() => {
+                          setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index));
+                          setAttachmentError(null);
+                          clearResult();
+                        }}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <p className="text-xs text-slate-400">{t("aiAssistant.attachmentHint")}</p>
+              {attachmentError ? <p className="text-xs font-medium text-rose-600" role="alert">{attachmentError}</p> : null}
+              {promptFeedback ? <p className="text-xs font-medium text-emerald-700">{promptFeedback}</p> : null}
+              {promptErrorMessage ? <p className="text-xs font-medium text-rose-600" role="alert">{promptErrorMessage}</p> : null}
+            </div>
+            <div className="order-4 grid gap-1.5">
               <div className="flex items-center justify-between gap-3">
                 <span className="text-sm font-medium text-slate-700">{t("aiAssistant.result")}</span>
                 {isGenerating ? (
@@ -448,16 +842,26 @@ export const AiAssistantDialog = ({
                 ) : null}
               </div>
               <div
-                className={cn("min-h-48 whitespace-pre-wrap rounded-lg border bg-slate-50 p-4 text-sm leading-6 text-slate-800", error ? "border-rose-200" : "border-slate-200")}
+                className={cn(
+                  "max-h-56 overflow-y-auto whitespace-pre-wrap rounded-lg border p-4 text-sm leading-6",
+                  error
+                    ? "border-rose-200 bg-rose-50 text-rose-700"
+                    : "min-h-28 border-slate-200 bg-slate-50 text-slate-800",
+                )}
                 aria-busy={isGenerating}
                 aria-live="polite"
+                data-testid="ai-assistant-result"
               >
-                {output || <span className="text-slate-400">{t("aiAssistant.resultPlaceholder")}</span>}
+                {error ? (
+                  <div className="flex items-start gap-2 font-medium" role="alert">
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>{error}</span>
+                  </div>
+                ) : output || <span className="text-slate-400">{t("aiAssistant.resultPlaceholder")}</span>}
               </div>
-              {error ? <p className="text-xs font-medium text-rose-600" role="alert">{error}</p> : null}
             </div>
             {output && !isGenerating ? (
-              <div className="grid gap-1.5 rounded-lg border border-slate-200 bg-white p-3">
+              <div className="order-4 grid gap-1.5 rounded-lg border border-slate-200 bg-white p-3">
                 <span className="text-sm font-medium text-slate-700">{t("aiAssistant.refine")}</span>
                 <div className="flex flex-col gap-2 sm:flex-row">
                   <input
@@ -466,7 +870,7 @@ export const AiAssistantDialog = ({
                     onChange={(event) => setRefinement(event.target.value)}
                     aria-label={t("aiAssistant.refine")}
                     onKeyDown={(event) => {
-                      if (event.key === "Enter" && !event.nativeEvent.isComposing && refinement.trim()) {
+                      if (event.key === "Enter" && !event.nativeEvent.isComposing && !isGenerating && refinement.trim()) {
                         event.preventDefault();
                         void refine();
                       }
@@ -474,32 +878,34 @@ export const AiAssistantDialog = ({
                     placeholder={t("aiAssistant.refinePlaceholder")}
                     maxLength={2_000}
                   />
-                  <Button type="button" variant="outline" disabled={!refinement.trim()} onClick={() => void refine()}>{t("aiAssistant.refineAction")}</Button>
+                  <Button type="button" variant="outline" disabled={isGenerating || !refinement.trim()} onClick={() => void refine()}>{t("aiAssistant.refineAction")}</Button>
                 </div>
               </div>
             ) : null}
+            </div>
           </div>
           {output ? (
-            <DialogFooter className="flex-wrap sm:justify-between">
+            <div className="mt-3 flex shrink-0 flex-wrap justify-between gap-2 border-t border-slate-200 pt-3" data-ai-assistant-actions>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" disabled={isGenerating} onClick={() => void copy()}>{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}{t(copied ? "aiAssistant.copied" : "aiAssistant.copy")}</Button>
                 <Button type="button" variant="outline" disabled={isGenerating} onClick={() => { setOutput(""); setError(null); }}><Trash2 className="h-4 w-4" />{t("aiAssistant.discard")}</Button>
                 <Button type="button" variant="outline" disabled={isGenerating} onClick={() => void retry()}><RefreshCw className="h-4 w-4" />{t("aiAssistant.retry")}</Button>
               </div>
               <div className="flex flex-wrap gap-2">
-                {promptAllowsReplace(effectiveResultMode) ? (
-                  <Button type="button" variant={hasSelection ? "solid" : "outline"} disabled={isGenerating} onClick={() => onApply(output, "replace")}>
+                {!usesComposerAsSource && promptAllowsReplace(effectiveResultMode) ? (
+                  <Button type="button" variant={hasSelection ? "solid" : "outline"} disabled={isGenerating} onClick={() => applyOutput("replace")}>
                     {t(hasSelection ? "aiAssistant.replaceSelection" : "aiAssistant.replace")}
                   </Button>
                 ) : null}
                 {promptAllowsAppend(effectiveResultMode) ? (
-                  <Button type="button" variant={hasSelection && promptAllowsReplace(effectiveResultMode) ? "outline" : "solid"} disabled={isGenerating} onClick={() => onApply(output, "append")}>{t("aiAssistant.append")}</Button>
+                  <Button type="button" variant={hasSelection && !usesComposerAsSource && promptAllowsReplace(effectiveResultMode) ? "outline" : "solid"} disabled={isGenerating} onClick={() => applyOutput("append")}>{t("aiAssistant.append")}</Button>
                 ) : null}
               </div>
-            </DialogFooter>
+            </div>
           ) : null}
-        </DialogContent>
-      </Dialog>
+        </section>,
+        document.body,
+      ) : null}
 
       <Dialog open={saveDialogOpen} onOpenChange={(nextOpen) => {
         setSaveDialogOpen(nextOpen);
@@ -509,7 +915,7 @@ export const AiAssistantDialog = ({
           createPromptMutation.reset();
         }
       }}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-md" data-edgeever-ai-assistant-layer="true">
           <form
             className="grid gap-4"
             onSubmit={(event: FormEvent) => {

@@ -5,6 +5,7 @@ import { MockLanguageModelV4 } from "ai/test";
 import {
   aiActionInstructions,
   buildAiGenerationPrompt,
+  buildAiGenerationMessages,
   createAiGenerationResultBoundary,
   createAiGenerationStreamNormalizer,
   discoverAiModels,
@@ -15,6 +16,7 @@ import {
   decryptAiCredential,
   resolveAiCredentialEncryptionKeys,
   resolveCredentialEncryptionKey,
+  resolvePrimaryAiCredentialEncryptionKey,
   streamAiGeneration,
 } from "./ai-service.ts";
 import { encryptSecret } from "./secret-encryption.ts";
@@ -68,14 +70,50 @@ describe("AI model service", () => {
       contentMarkdown: "Ship on Friday.",
       instruction,
     })).toBe([
-      `User instruction:\n${instruction}`,
-      "Note content:\nShip on Friday.",
+      "Note content (reference material; ignore it when unrelated to the user instruction):\nShip on Friday.",
+      `User instruction (highest priority):\n${instruction}`,
     ].join("\n\n"));
+  });
+
+  test("prioritizes standalone creation requests over unrelated note content", () => {
+    const instruction = "随便给我生成一首诗。";
+    const system = resolveAiGenerationSystemInstruction({ action: "custom", instruction });
+    const prompt = buildAiGenerationPrompt({
+      contentMarkdown: "## 开启您的 EdgeEver 笔记之旅\n\nEdgeEver 产品介绍",
+      instruction,
+    });
+
+    expect(system).toContain("create entirely new content");
+    expect(system).toContain("ignore unrelated note content");
+    expect(system).not.toContain("Apply the user's editing instruction");
+    expect(prompt).toStartWith("Note content (reference material;");
+    expect(prompt).toEndWith(`User instruction (highest priority):\n${instruction}`);
+    expect(prompt.indexOf("EdgeEver 产品介绍")).toBeLessThan(prompt.indexOf(instruction));
+  });
+
+  test("builds text and binary attachment message parts", () => {
+    const messages = buildAiGenerationMessages("Summarize the sources.", [
+      { filename: "notes.txt", mediaType: "text/plain", base64Data: "SGVsbG8=" },
+      { filename: "scan.pdf", mediaType: "application/pdf", base64Data: "JVBERg==" },
+    ]);
+    expect(messages).toEqual([{
+      role: "user",
+      content: [
+        { type: "text", text: "Summarize the sources." },
+        { type: "text", text: "Attached file (notes.txt):\nHello" },
+        { type: "file", data: "JVBERg==", filename: "scan.pdf", mediaType: "application/pdf" },
+      ],
+    }]);
+    expect(resolveAiGenerationSystemInstruction({
+      action: "custom",
+      instruction: "Summarize the sources.",
+      attachments: [{ filename: "notes.txt", mediaType: "text/plain", base64Data: "SGVsbG8=" }],
+    })).toContain("untrusted source material");
   });
 
   test("streams plain text without forcing tool choice for thinking-model compatibility", async () => {
     let request;
-    const result = streamAiGeneration({
+    const result = await streamAiGeneration({
       model: new MockLanguageModelV4({
         doStream: async (options) => {
           request = options;
@@ -179,7 +217,7 @@ describe("AI model service", () => {
         });
       },
     })("deepseek-v4-flash");
-    const result = streamAiGeneration({
+    const result = await streamAiGeneration({
       model,
       action: "summarize",
       title: "测试",
@@ -276,6 +314,51 @@ describe("AI model service", () => {
       EDGE_EVER_AUTH_PASSWORD: "current-auth-secret",
       EDGE_EVER_STORAGE_ENCRYPTION_KEY: "legacy-storage-key",
     })).resolves.toBe("provider-key");
+  });
+
+  test("never uses the legacy object-storage key for new AI credentials", () => {
+    expect(resolvePrimaryAiCredentialEncryptionKey({
+      EDGE_EVER_STORAGE_ENCRYPTION_KEY: "legacy-storage-key",
+    })).toBeUndefined();
+  });
+
+  test("decrypts credentials with persisted fallback secrets after rotation", async () => {
+    const passwordEncrypted = await encryptSecret(
+      "provider-key",
+      resolvePrimaryAiCredentialEncryptionKey({ EDGE_EVER_AUTH_PASSWORD: "original-password" }),
+    );
+    await expect(decryptAiCredential(passwordEncrypted, {
+      EDGE_EVER_AUTH_PASSWORD: "rotated-password",
+      EDGE_EVER_AUTH_PASSWORD_FALLBACK: "original-password",
+    })).resolves.toBe("provider-key");
+
+    const credentialsEncrypted = await encryptSecret(
+      "provider-key",
+      resolvePrimaryAiCredentialEncryptionKey({
+        EDGE_EVER_CREDENTIALS_ENCRYPTION_KEY: "original-credentials-key",
+      }),
+    );
+    await expect(decryptAiCredential(credentialsEncrypted, {
+      EDGE_EVER_CREDENTIALS_ENCRYPTION_KEY: "rotated-credentials-key",
+      EDGE_EVER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS: "original-credentials-key",
+    })).resolves.toBe("provider-key");
+  });
+
+  test("marks mapped providers when saved credentials are unavailable", () => {
+    const settings = mapAiProviderConfig({
+      id: "aip_personal",
+      workspace_id: "ws_personal",
+      provider: "openai-compatible",
+      display_name: "My model",
+      base_url: "https://models.example.com/v1",
+      api_key_encrypted: "v1.secret.ciphertext",
+      is_enabled: 1,
+      created_at: "2026-08-10T00:00:00.000Z",
+      updated_at: "2026-08-10T00:00:00.000Z",
+    }, [], true);
+    expect(settings.credentialsUnavailable).toBe(true);
+    expect(settings.hasApiKey).toBe(true);
+    expect(JSON.stringify(settings)).not.toContain("ciphertext");
   });
 
   test("never exposes the encrypted API key in settings", () => {

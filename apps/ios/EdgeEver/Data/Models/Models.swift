@@ -29,6 +29,27 @@ struct MobileSession: Codable, Equatable, Sendable {
     var user: AuthUser?
 }
 
+struct InstanceStorageDiagnostics: Codable, Equatable, Sendable {
+    var database: String?
+    var resources: String?
+}
+
+struct InstanceHealth: Codable, Equatable, Sendable {
+    var ok: Bool
+    var name: String
+    var runtime: String?
+    var containerImageSource: String?
+    var authMode: String?
+    var build: String?
+    var migration: String?
+    var storage: InstanceStorageDiagnostics?
+    var objectStorageProvider: String?
+}
+
+struct InstanceRelease: Codable, Equatable, Sendable {
+    var version: String
+}
+
 struct LoginDeviceSession: Codable, Equatable, Sendable, Identifiable {
     var id: String
     var userAgent: String?
@@ -154,6 +175,24 @@ struct AiGenerateInput: Encodable, Sendable {
     var targetLanguage: String?
     var tone: String? = nil
     var instruction: String? = nil
+}
+
+struct AiTagSuggestionsInput: Encodable, Sendable {
+    var title: String
+    var contentMarkdown: String
+    var currentTags: [String]
+    var locale: String
+}
+
+struct AiTagSuggestion: Codable, Equatable, Sendable, Identifiable {
+    var name: String
+    var existing: Bool
+
+    var id: String { name }
+}
+
+struct AiTagSuggestionsResponse: Codable, Equatable, Sendable {
+    var suggestions: [AiTagSuggestion]
 }
 
 enum AiPromptParameterKind: String, Codable, Sendable {

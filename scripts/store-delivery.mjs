@@ -13,6 +13,8 @@ Options:
   --release <tag>             Required formal GitHub Release tag
   --platform <target>         android, ios, or both (default: both)
   --android-track <track>     production, alpha, beta, or internal (default: production)
+  --recover-play-apk          Skip Play upload and recover its already signed APK
+  --ios-build-number <number> Submit an existing App Store Connect build without rebuilding
   --repository <owner/name>   GitHub repository (default: ${DEFAULT_REPOSITORY})
   --dry-run                   Print the workflow dispatch plan
   --help                      Show this help
@@ -25,12 +27,15 @@ export const parseStoreDeliveryArgs = (argv) => {
     androidTrack: "production",
     repository: DEFAULT_REPOSITORY,
     dryRun: false,
+    recoverPlayApk: false,
+    iosBuildNumber: "",
     help: false,
   };
   const valueOptions = new Map([
     ["--release", "releaseTag"],
     ["--platform", "platform"],
     ["--android-track", "androidTrack"],
+    ["--ios-build-number", "iosBuildNumber"],
     ["--repository", "repository"],
   ]);
 
@@ -38,6 +43,10 @@ export const parseStoreDeliveryArgs = (argv) => {
     const argument = argv[index];
     if (argument === "--dry-run") {
       options.dryRun = true;
+      continue;
+    }
+    if (argument === "--recover-play-apk") {
+      options.recoverPlayApk = true;
       continue;
     }
     if (argument === "--help") {
@@ -73,6 +82,12 @@ export const parseStoreDeliveryArgs = (argv) => {
   if (!/^[^/\s]+\/[^/\s]+$/.test(options.repository)) {
     throw new Error("--repository must use owner/name format.");
   }
+  if (options.iosBuildNumber && !/^[1-9]\d*$/.test(options.iosBuildNumber)) {
+    throw new Error("--ios-build-number must be a positive integer.");
+  }
+  if (options.iosBuildNumber && options.platform === "android") {
+    throw new Error("--ios-build-number requires --platform ios or both.");
+  }
   return options;
 };
 
@@ -91,6 +106,10 @@ const run = (options) => {
     `platform=${options.platform}`,
     "-f",
     `android_track=${options.androidTrack}`,
+    "-f",
+    `recover_play_apk=${options.recoverPlayApk}`,
+    "-f",
+    `ios_build_number=${options.iosBuildNumber}`,
   ];
   if (options.dryRun) {
     console.log(`gh ${args.join(" ")}`);
@@ -104,7 +123,9 @@ const run = (options) => {
     stdio: ["ignore", "pipe", "inherit"],
   });
   if (result.status !== 0) {
-    throw new Error(`GitHub workflow dispatch failed with status ${result.status ?? 1}.`);
+    throw new Error(
+      `GitHub workflow dispatch failed with status ${result.status ?? 1}.`,
+    );
   }
   const output = String(result.stdout ?? "").trim();
   console.log(output || "Store delivery workflow dispatched.");

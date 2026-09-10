@@ -5,6 +5,10 @@ import {
   AiProviderConfigCreateSchema,
   AiProviderConfigUpdateSchema,
   AiProviderConnectionTestSchema,
+  AiTagSuggestionPromptUpdateSchema,
+  AiTagSuggestionsRequestSchema,
+  MAX_AI_TAG_SUGGESTIONS,
+  normalizeTags,
   promptNeedsTargetLanguage,
   promptNeedsTone,
 } from "@edgeever/shared";
@@ -22,8 +26,10 @@ import {
   getAiModelConfig,
   getAiProviderConfig,
   getAiSettings,
+  getAiTagSuggestionPrompt,
   getDefaultAiModelId,
   generateAiGeneration,
+  generateAiTagSuggestions,
   loadDefaultAiModel,
   normalizeAiGenerationText,
   normalizeAiBaseUrl,
@@ -35,10 +41,18 @@ import { createId, isoNow } from "./entity-utils";
 import { apiError, forbidden, notFound } from "./http-errors";
 import { getWorkspaceId, requireUser } from "./request-auth";
 import { encryptSecret } from "./secret-encryption";
+import { listTagSummaries } from "./tag-service";
 
 type AiRouteDependencies = {
   isDemoMode: (environment: Bindings) => boolean;
   testConnection?: (config: Parameters<typeof testAiModel>[0]) => Promise<{ text: string }>;
+  suggestTags?: (input: {
+    title: string;
+    contentMarkdown: string;
+    currentTags: string[];
+    existingTags: string[];
+    locale?: string;
+  }) => Promise<string[]>;
 };
 
 const providerErrorMessage = (error: unknown) => {
@@ -46,6 +60,21 @@ const providerErrorMessage = (error: unknown) => {
   if (!(error instanceof Error)) return "The AI provider request failed.";
   return error.message.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").slice(0, 1000);
 };
+
+const validateAiGeneration = zValidator("json", AiGenerateSchema, (result, context) => {
+  if (result.success) return;
+  const sourceRequired = result.error.issues.some(
+    (issue) => issue.path[0] === "contentMarkdown" && issue.message === "Note content is required.",
+  );
+  return apiError(
+    context,
+    sourceRequired ? "ai_source_required" : "ai_request_invalid",
+    sourceRequired
+      ? "Note content is required for this AI action."
+      : "The AI request is invalid.",
+    400,
+  );
+});
 
 const encryptionConfigured = (context: AppContext) =>
   Boolean(resolvePrimaryAiCredentialEncryptionKey(context.env));
@@ -55,6 +84,8 @@ const readSettings = (context: AppContext, dependencies: AiRouteDependencies) =>
   getWorkspaceId(context),
   encryptionConfigured(context),
   dependencies.isDemoMode(context.env),
+  context.req.query("locale"),
+  context.env,
 );
 
 const denyMutation = (context: AppContext, dependencies: AiRouteDependencies) => {
@@ -443,9 +474,89 @@ export const registerAiRoutes = (app: Hono<AppEnv>, dependencies: AiRouteDepende
     },
   );
 
+  app.put(
+    "/api/v1/ai/tag-suggestion-prompt",
+    zValidator("json", AiTagSuggestionPromptUpdateSchema),
+    async (context) => {
+      const denied = denyMutation(context, dependencies);
+      if (denied) return denied;
+      const input = context.req.valid("json");
+      const workspaceId = getWorkspaceId(context);
+      const now = isoNow();
+      await context.env.storage.db.batch([
+        context.env.storage.db.prepare(
+          `INSERT INTO ai_workspace_settings (
+             workspace_id, tag_suggestion_prompt, created_at, updated_at
+           ) VALUES (?, ?, ?, ?)
+           ON CONFLICT(workspace_id) DO UPDATE SET
+             tag_suggestion_prompt = excluded.tag_suggestion_prompt,
+             updated_at = excluded.updated_at`,
+        ).bind(workspaceId, input.prompt, now, now),
+        auditStatement(
+          context.env.storage.db,
+          "user",
+          context.get("auth").actorId,
+          "workspace.ai_tag_suggestion_prompt.update",
+          "workspace",
+          workspaceId,
+          { customized: input.prompt !== null },
+        ),
+      ]);
+      return context.json(await readSettings(context, dependencies));
+    },
+  );
+
+  app.post(
+    "/api/v1/ai/tag-suggestions",
+    zValidator("json", AiTagSuggestionsRequestSchema),
+    async (context) => {
+      const denied = requireUser(context);
+      if (denied) return denied;
+      try {
+        const input = context.req.valid("json");
+        const workspaceId = getWorkspaceId(context);
+        const tagSummaries = await listTagSummaries(context.env.storage.db, workspaceId);
+        const allCanonicalTags = new Map(
+          tagSummaries.map((tag) => [tag.name.toLocaleLowerCase(), tag.name]),
+        );
+        const popularTags = [...tagSummaries]
+          .sort((left, right) => right.memoCount - left.memoCount || left.name.localeCompare(right.name))
+          .slice(0, 200)
+          .map((tag) => tag.name);
+        const existingTags = Array.from(new Set([
+          ...input.currentTags.map((tag) => allCanonicalTags.get(tag.toLocaleLowerCase()) ?? tag),
+          ...popularTags,
+        ]));
+        const rawSuggestions = dependencies.suggestTags
+          ? await dependencies.suggestTags({ ...input, existingTags })
+          : await generateAiTagSuggestions({
+            ...input,
+            existingTags,
+            instruction: await getAiTagSuggestionPrompt(context.env.storage.db, workspaceId, input.locale),
+            model: await loadDefaultAiModel(context.env.storage.db, workspaceId, context.env),
+            abortSignal: context.req.raw.signal,
+          });
+        const currentTagKeys = new Set(input.currentTags.map((tag) => tag.toLocaleLowerCase()));
+        const suggestionNames = normalizeTags(
+          normalizeTags(rawSuggestions)
+            .filter((name) => !currentTagKeys.has(name.toLocaleLowerCase()))
+            .map((name) => allCanonicalTags.get(name.toLocaleLowerCase()) ?? name),
+        ).slice(0, MAX_AI_TAG_SUGGESTIONS);
+        const suggestions = suggestionNames
+          .map((name) => {
+            const canonicalName = allCanonicalTags.get(name.toLocaleLowerCase());
+            return { name: canonicalName ?? name, existing: Boolean(canonicalName) };
+          });
+        return context.json({ suggestions });
+      } catch (error) {
+        return withAiError(context, error, "ai_tag_suggestions_failed");
+      }
+    },
+  );
+
   app.post(
     "/api/v1/ai/generate",
-    zValidator("json", AiGenerateSchema),
+    validateAiGeneration,
     async (context) => {
       const denied = requireUser(context);
       if (denied) return denied;
@@ -510,7 +621,7 @@ export const registerAiRoutes = (app: Hono<AppEnv>, dependencies: AiRouteDepende
             send({ type: "start" });
             try {
               if (input.stream) {
-                const result = streamAiGeneration(generationInput);
+                const result = await streamAiGeneration(generationInput);
                 const normalizer = createAiGenerationStreamNormalizer(resultBoundary);
                 let hasContent = false;
                 for await (const part of result.stream) {

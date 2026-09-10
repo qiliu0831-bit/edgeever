@@ -14,7 +14,16 @@ import {
   deploymentPrompts,
   manualDeploymentCopy,
 } from "../apps/site/src/deployment-prompts";
-import { decideUpstreamSync } from "../scripts/upstream-sync-plan.mjs";
+import {
+  decideUpstreamSync,
+  shouldRedeploy,
+} from "../scripts/upstream-sync-plan.mjs";
+import { repositoryWranglerConfigError } from "../scripts/wrangler-runner.mjs";
+import {
+  edgeEverDeploymentEnvironment,
+  hasPlaceholderD1Binding,
+  shouldRunEdgeEverDeployment,
+} from "../packages/wrangler/dispatch.mjs";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const normalizeLineEndings = (value: string) => value.replace(/\r\n/g, "\n");
@@ -99,6 +108,80 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(scripts["deploy:cloudflare-builds"]).toBe(
       "EDGE_EVER_USE_EXISTING_AUTH_SECRET=true bun run deploy:ci",
     );
+    expect(scripts["build:cloudflare"]).toContain("bun run build:worker");
+
+    const wranglerConfig = readRepositoryFile("wrangler.toml");
+    expect(wranglerConfig).toContain('main = ".wrangler/edgeever-worker/index.js"');
+    expect(wranglerConfig).toContain("no_bundle = true");
+    expect(wranglerConfig).toContain("find_additional_modules = true");
+    expect(wranglerConfig).toContain('globs = ["modules/*.js"]');
+  });
+
+  test("Cloudflare's default Wrangler command cannot bypass the deployment pipeline", () => {
+    const packageJson = JSON.parse(readRepositoryFile("package.json"));
+    const shimPackage = JSON.parse(readRepositoryFile("packages/wrangler/package.json"));
+    const shim = readRepositoryFile("packages/wrangler/bin/wrangler.js");
+    const englishGuide = readRepositoryFile("docs/deploy-cloudflare-button.md");
+    const chineseGuide = readRepositoryFile("docs/deploy-cloudflare-button.zh-CN.md");
+
+    expect(packageJson.devDependencies.wrangler).toBe("workspace:*");
+    expect(shimPackage.name).toBe("wrangler");
+    expect(shimPackage.dependencies["edgeever-wrangler-cli"]).toMatch(/^npm:wrangler@/);
+    expect(shim).toContain('["run", "deploy"]');
+    const placeholderConfig = 'database_id = "00000000-0000-0000-0000-000000000000"';
+    const legacyConfig = 'database_id = "11111111-1111-1111-1111-111111111111"';
+    expect(hasPlaceholderD1Binding(placeholderConfig)).toBe(true);
+    expect(hasPlaceholderD1Binding(legacyConfig)).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(true);
+    expect(shouldRunEdgeEverDeployment(["deploy"], {}, placeholderConfig)).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1" },
+      legacyConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1", WRANGLER_CONFIG: "custom.toml" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy", "--config", "custom.toml"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy", "--env", "production"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy", "--name", "custom-worker"],
+      { WORKERS_CI: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(shouldRunEdgeEverDeployment(
+      ["deploy"],
+      { WORKERS_CI: "1", EDGE_EVER_WRANGLER_BYPASS_SHIM: "1" },
+      placeholderConfig,
+    )).toBe(false);
+    expect(edgeEverDeploymentEnvironment({ WORKERS_CI: "1" }))
+      .toMatchObject({
+        EDGE_EVER_DEPLOYMENT_TRIGGER: "main_push",
+        EDGE_EVER_DEPLOYMENT_METHOD: "cloudflare_workers_builds_default",
+      });
+    expect(englishGuide).toContain("Deploy command: npx wrangler deploy");
+    expect(chineseGuide).toContain("Deploy command: npx wrangler deploy");
+  });
+
+  test("deployment verification lets piped diagnostics flush before exiting", () => {
+    const verificationScript = readRepositoryFile("scripts/verify-deployment.mjs");
+
+    expect(verificationScript).toContain("process.exitCode = 1");
+    expect(verificationScript).not.toContain("process.exit(1)");
   });
 
   test("online deployment declares the required authentication Secret", () => {
@@ -114,15 +197,58 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(chineseGuide).toContain("Worker 运行时 Secret，不是 Workers Builds 构建变量");
   });
 
+  test("Workers Builds receives configuration but never the runtime password", () => {
+    const setup = readRepositoryFile("scripts/cloudflare-workers-builds.mjs");
+
+    expect(setup).toContain('"AUTH_USERNAME"');
+    expect(setup).toContain('"AUTH_LOGIN_WINDOW_SECONDS"');
+    expect(setup).not.toContain('"AUTH_PASSWORD",');
+    expect(setup).not.toContain('"AUTH_PASSWORD_HASH",');
+    expect(setup).not.toContain("Missing EDGE_EVER_AUTH_PASSWORD");
+    expect(setup).toContain("is_secret: false");
+  });
+
   test("online deployment resolves the D1 id without editing the repository config", () => {
     const runner = readRepositoryFile("scripts/run-wrangler.mjs");
+    const wranglerConfig = readRepositoryFile("wrangler.toml");
     const englishAgentDoc = readRepositoryFile("docs/agent-deploy-cloudflare.md");
     const chineseAgentDoc = readRepositoryFile("docs/agent-deploy-cloudflare.zh-CN.md");
 
+    expect(wranglerConfig).toContain(
+      'database_id = "00000000-0000-0000-0000-000000000000"',
+    );
     expect(runner).toContain('"d1", "list", "--json"');
     expect(runner).toContain("findD1DatabaseIdByName");
+    expect(runner).toContain("repositoryWranglerConfigError(config, usesRepositoryConfig)");
+    expect(runner).not.toContain("replace the database_id placeholder");
     expect(englishAgentDoc).toContain("automatically resolves the D1 UUID");
     expect(chineseAgentDoc).toContain("自动查询 D1 UUID");
+  });
+
+  test("rejects instance-specific values in the repository Wrangler config", () => {
+    const repositoryConfig = readRepositoryFile("wrangler.toml");
+    const instanceConfigs = [
+      repositoryConfig.replace('name = "edgeever"', 'name = "my-notes"'),
+      repositoryConfig.replace("workers_dev = true", "workers_dev = false"),
+      repositoryConfig.replace('database_name = "edgeever"', 'database_name = "my-notes"'),
+      repositoryConfig.replace(
+        'database_id = "00000000-0000-0000-0000-000000000000"',
+        'database_id = "11111111-1111-1111-1111-111111111111"',
+      ),
+      repositoryConfig.replace('bucket_name = "edgeever-resources"', 'bucket_name = "my-notes"'),
+      repositoryConfig.replace('compatibility_date = "2026-06-26"', 'compatibility_date = "2026-08-17"'),
+      `${repositoryConfig}\n[vars]\nEDGE_EVER_AUTH_USERNAME = "owner"\n`,
+      `${repositoryConfig}\n[[routes]]\npattern = "notes.example.com"\ncustom_domain = true\n`,
+    ];
+
+    for (const instanceConfig of instanceConfigs) {
+      const error = repositoryWranglerConfigError(instanceConfig, true);
+      expect(error).toContain("Refusing instance-specific setting");
+      expect(error).toContain("EDGE_EVER_*");
+      expect(error).toContain("WRANGLER_CONFIG");
+    }
+    expect(repositoryWranglerConfigError(repositoryConfig, true)).toBeUndefined();
+    expect(repositoryWranglerConfigError(instanceConfigs[0], false)).toBeUndefined();
   });
 
   test("keeps D1 resolver diagnostics out of Wrangler JSON stdout", () => {
@@ -142,13 +268,13 @@ describe("Cloudflare deployment entrypoints", () => {
     const environment = {
       ...inheritedEnvironment,
       EDGE_EVER_INSTANCE: "",
-      WRANGLER_CONFIG: resolve(workingDirectory, "wrangler.toml"),
+      WRANGLER_CONFIG: resolve(workingDirectory, "wrangler.external.toml"),
     };
 
     try {
       mkdirSync(wranglerBinDirectory, { recursive: true });
       writeFileSync(
-        resolve(workingDirectory, "wrangler.toml"),
+        resolve(workingDirectory, "wrangler.external.toml"),
         [
           'name = "edgeever"',
           'database_name = "edgeever"',
@@ -248,7 +374,7 @@ describe("Cloudflare deployment entrypoints", () => {
     try {
       mkdirSync(wranglerBinDirectory, { recursive: true });
       writeFileSync(
-        resolve(workingDirectory, "wrangler.toml"),
+        resolve(workingDirectory, "wrangler.external.toml"),
         [
           'name = "edgeever"',
           "workers_dev = true",
@@ -263,7 +389,14 @@ describe("Cloudflare deployment entrypoints", () => {
       writeFileSync(
         resolve(wranglerBinDirectory, "wrangler.js"),
         [
-          'if (process.argv.includes("deploy")) {',
+          'if (process.argv.includes("deployments")) {',
+          '  process.stdout.write(JSON.stringify({ versions: [{ version_id: "legacy-version", percentage: 100 }] }));',
+          '} else if (process.argv.includes("versions")) {',
+          '  process.stdout.write(JSON.stringify({ resources: { bindings: [',
+          '    { name: "RESOURCES", type: "r2_bucket", bucket_name: "legacy-user-resources" },',
+          '    { name: "EDGE_EVER_AUTH_USERNAME", type: "plain_text", text: "legacy-owner" }',
+          '  ] } }));',
+          '} else if (process.argv.includes("deploy")) {',
           '  process.stdout.write("Uploaded edgeever\\nDeployed edgeever triggers (0.4 sec)\\n  https://edgeever.example.workers.dev\\nCurrent Version ID: version-1\\n");',
           "}",
           "",
@@ -281,7 +414,7 @@ describe("Cloudflare deployment entrypoints", () => {
             CI: "true",
             EDGE_EVER_AUTH_PASSWORD: "test-password",
             EDGE_EVER_INSTANCE: "",
-            WRANGLER_CONFIG: resolve(workingDirectory, "wrangler.toml"),
+            WRANGLER_CONFIG: resolve(workingDirectory, "wrangler.external.toml"),
           },
         },
       );
@@ -290,7 +423,17 @@ describe("Cloudflare deployment entrypoints", () => {
       expect(JSON.parse(readFileSync(
         resolve(workingDirectory, ".wrangler.deployment-targets.json"),
         "utf8",
-      ))).toEqual({ urls: ["https://edgeever.example.workers.dev"] });
+      ))).toEqual({
+        urls: ["https://edgeever.example.workers.dev"],
+        versionId: "version-1",
+      });
+      const generatedConfig = readFileSync(
+        resolve(workingDirectory, ".wrangler.generated.toml"),
+        "utf8",
+      );
+      expect(generatedConfig).toContain('bucket_name = "legacy-user-resources"');
+      expect(generatedConfig).toContain('EDGE_EVER_R2_BUCKET_NAME = "legacy-user-resources"');
+      expect(generatedConfig).toContain('EDGE_EVER_AUTH_USERNAME = "legacy-owner"');
     } finally {
       rmSync(workingDirectory, { force: true, recursive: true });
     }
@@ -309,11 +452,18 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(workflow).toContain("EDGE_EVER_UPDATE_CHANNEL");
     expect(workflow).toContain("stable)");
     expect(workflow).toContain("edge)");
-    expect(workflow).toContain("force_redeploy");
+    expect(workflow).toContain("FORCE_REDEPLOY: ${{ github.event_name == 'workflow_dispatch' }}");
+    expect(workflow).not.toContain("force_redeploy:");
     expect(workflow).toContain("bun run db:migrate:local");
     expect(bunConfig).toContain('pathIgnorePatterns = ["tests/e2e/**"]');
-    expect(scripts.test).toBe("bun test --path-ignore-patterns='tests/e2e/**'");
-    expect(workflow).toContain(scripts.test);
+    expect(scripts.test).toBe("bun run test:bulk && bun run test:integration");
+    expect(scripts["test:bulk"]).toContain("--path-ignore-patterns='tests/e2e/**'");
+    expect(scripts["test:bulk"]).toContain("apps/api/src/companion-learning.test.mjs");
+    expect(scripts["test:bulk"]).toContain("apps/api/src/resource-upload-integration.test.mjs");
+    expect(scripts["test:integration"]).toBe(
+      "bun test apps/api/src/companion-learning.test.mjs apps/api/src/resource-upload-integration.test.mjs",
+    );
+    expect(workflow).toContain("bun run test");
     expect(workflow.match(/if: steps\.upstream\.outputs\.align_mode == 'merge'/g)).toHaveLength(2);
     expect(workflow).toContain("git push origin HEAD:main");
     expect(workflow).not.toContain("git push --force-with-lease origin HEAD:main");
@@ -327,6 +477,15 @@ describe("Cloudflare deployment entrypoints", () => {
     expect(workflow).toContain("already_on_target");
     expect(workflow).toContain("fork_mode=mirror");
     expect(workflow).toContain("GITHUB_STEP_SUMMARY");
+    expect(workflow).toContain("name: Sync Fork and trigger deployment");
+    expect(workflow).toContain("name: Report result / 输出结果");
+    expect(workflow).toContain("::notice title=Manual redeploy / 手动重新部署");
+    expect(workflow).toContain("PUBLISH_OUTCOME: ${{ steps.publish.outcome }}");
+    expect(workflow).toContain("DEPLOY_TRIGGER_OUTCOME: ${{ steps.deploy.outcome }}");
+    expect(workflow).toContain("| Git publish / Git 发布 |");
+    expect(workflow).toContain("| Deployment trigger / 部署触发 |");
+    expect(workflow).toContain("| Live deployment / 线上部署 |");
+    expect(workflow).toContain("Not verified by this workflow / 本工作流未验证");
     expect(workflow).toContain("EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL");
     expect(workflow).toContain("EDGE_EVER_PRESERVE_FORK_CHANGES");
     expect(workflow).toContain("PRESERVE_FORK_CHANGES");
@@ -356,22 +515,33 @@ describe("Cloudflare deployment entrypoints", () => {
     }
   });
 
-  test("keeps a forced-redeploy commit on the deploy-mirror update path", () => {
+  test("republishes an already-aligned deploy mirror when redeploy is requested", () => {
     expect(
       decideUpstreamSync({
-        contentMatchesTarget: false,
-        forceRedeploy: false,
-        headEqualsTarget: false,
-        headIsAncestorOfTarget: false,
+        contentMatchesTarget: true,
+        forceRedeploy: true,
+        headEqualsTarget: true,
+        headIsAncestorOfTarget: true,
         preserveForkChanges: false,
-        targetIsAncestorOfHead: false,
+        targetIsAncestorOfHead: true,
       }),
     ).toEqual({
-      alignMode: "snapshot",
-      reason: "deploy_mirror_reset",
-      republishOnly: false,
-      updateRequired: true,
+      alignMode: "none",
+      reason: "already_on_target",
+      republishOnly: true,
+      updateRequired: false,
     });
+  });
+
+  test("manual dispatch redeploys through an older Fork workflow", () => {
+    expect(shouldRedeploy({
+      eventName: "workflow_dispatch",
+      forceRedeploy: false,
+    })).toBe(true);
+    expect(shouldRedeploy({
+      eventName: "schedule",
+      forceRedeploy: false,
+    })).toBe(false);
   });
 
   test("snapshots a deploy mirror that moved ahead of the stable release", () => {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { listMemos, toFtsQuery } from "./memo-list-service.ts";
+import { createDefaultDiagramDocument, serializeDiagramDocument } from "@edgeever/shared";
+import { listMemos, mapMemoSummary, toFtsQuery } from "./memo-list-service.ts";
 
 const memoRow = (id, overrides = {}) => ({
   id,
@@ -37,6 +38,13 @@ const createDatabase = ({ rows = [], totalCount = rows.length } = {}) => {
 };
 
 describe("memo list service", () => {
+  test("identifies diagram notes without exposing their source as the note type", () => {
+    const content_markdown = serializeDiagramDocument(createDefaultDiagramDocument("architecture"));
+
+    expect(mapMemoSummary(memoRow("memo_1", { content_markdown })).diagramKind).toBe("architecture");
+    expect(mapMemoSummary(memoRow("memo_2")).diagramKind).toBeNull();
+  });
+
   test("paginates with an opaque cursor and reuses its sort position", async () => {
     const firstDatabase = createDatabase({
       rows: [memoRow("memo_1"), memoRow("memo_2"), memoRow("memo_3")],
@@ -80,6 +88,23 @@ describe("memo list service", () => {
       expect(call.sql).toContain("m.is_deleted = 1");
       expect(call.sql).toContain("m.tags_json <> '[]'");
       expect(call.parameters.slice(0, 4)).toEqual(["ws_1", "ws_1", "nb_parent", "ws_1"]);
+    }
+  });
+
+  test("filters by one exact tag in page and count queries", async () => {
+    const database = createDatabase();
+    await listMemos(database, {
+      workspaceId: "ws_1",
+      tag: "Demo",
+    });
+
+    expect(database.calls).toHaveLength(2);
+    for (const call of database.calls) {
+      expect(call.sql).toContain("FROM memo_tags mt");
+      expect(call.sql).toContain("mt.normalized_name = LOWER(?)");
+      expect(call.parameters.filter((value) => value === "ws_1").length).toBeGreaterThanOrEqual(2);
+      expect(call.parameters).toContain("Demo");
+      expect(call.sql).not.toContain("m.tags_json LIKE");
     }
   });
 

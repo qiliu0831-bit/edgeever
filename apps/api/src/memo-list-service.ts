@@ -3,6 +3,7 @@ import {
   DEFAULT_MEMO_TITLE,
   docToText,
   markdownToDoc,
+  getDiagramSummary,
   type MemoSummary,
 } from "@edgeever/shared";
 import { parseJsonArray } from "./entity-utils";
@@ -43,6 +44,7 @@ export type ListMemosInput = {
   notebookId?: string;
   includeNotebookDescendants?: boolean;
   query?: string;
+  tag?: string;
   includeTrash?: boolean;
   sort?: string;
   filter?: string;
@@ -67,6 +69,7 @@ export const mapMemoSummary = (row: MemoSummaryRow): MemoSummary => ({
     row.excerpt ||
     createExcerpt(row.content_text ?? "") ||
     createExcerpt(docToText(markdownToDoc(row.content_markdown ?? ""))),
+  ...getDiagramSummary(row.content_markdown),
   tags: parseJsonArray(row.tags_json),
   isPinned: Boolean(row.is_pinned),
   isArchived: Boolean(row.is_archived),
@@ -150,6 +153,7 @@ export const listMemos = async (
 ): Promise<ListMemosResult> => {
   const notebookId = input.notebookId;
   const query = input.query?.trim();
+  const tag = input.tag?.trim();
   const includeTrash = input.includeTrash === true;
   const sort = normalizeMemoListSort(input.sort);
   const filter = normalizeMemoListFilter(input.filter);
@@ -184,6 +188,13 @@ export const listMemos = async (
       baseConditions.push("m.notebook_id = ?");
       baseBinds.push(notebookId);
     }
+  }
+
+  if (tag) {
+    baseConditions.push(
+      "EXISTS (SELECT 1 FROM memo_tags mt WHERE mt.memo_id = m.id AND mt.workspace_id = ? AND mt.normalized_name = LOWER(?))",
+    );
+    baseBinds.push(input.workspaceId, tag);
   }
 
   if (filter === "tagged") baseConditions.push("m.tags_json <> '[]'");
